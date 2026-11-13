@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fall Detection - ESP32 + MPU6050</title>
+<script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f6fa; --card: #ffffff; --text: #1d2433; --muted: #6b7486;
+    --ok: #1a9d55; --danger: #d92d2d; --accent: #2f6fed; --border: #e2e6ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #12151c; --card: #1c212c; --text: #e8ecf5; --muted: #98a1b5; --border: #2b3242; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  .container { max-width: 1000px; margin: 0 auto; padding: 20px 16px 40px; }
+  header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  h1 { font-size: 22px; margin: 0; }
+
+  .banner { margin: 16px 0; padding: 16px; border-radius: 12px; text-align: center;
+            font-size: 20px; font-weight: 700; background: var(--ok); color: #fff; }
+  .banner.fall { background: var(--danger); animation: pulse 0.6s infinite alternate; }
+  @keyframes pulse { to { opacity: 0.6; } }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 28px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .card .unit { font-size: 13px; color: var(--muted); margin-left: 4px; font-weight: 400; }
+
+
+  .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 16px; }
+  .chart-box { position: relative; height: 260px; }
+  .chart-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+
+  .controls { margin-top: 16px; }
+  .btn-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+  button { flex: 1; min-width: 160px; padding: 14px; font-size: 16px; font-weight: 600; border: 2px solid var(--accent);
+           border-radius: 10px; background: transparent; color: var(--accent); cursor: pointer; transition: .15s; }
+  button.on { background: var(--accent); color: #fff; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Hệ thống phát hiện té ngã</h1>
+  </header>
+
+  <div class="banner">Chờ dữ liệu...</div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Gia tốc X</div><div class="value"><span class="val-ax">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Gia tốc Y</div><div class="value"><span class="val-ay">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Gia tốc Z</div><div class="value"><span class="val-az">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Gia tốc tổng</div><div class="value"><span class="val-acc">--</span><span class="unit">g</span></div></div>
+    <div class="card"><div class="label">Pitch</div><div class="value"><span class="val-pitch">--</span><span class="unit">°</span></div></div>
+    <div class="card"><div class="label">Roll</div><div class="value"><span class="val-roll">--</span><span class="unit">°</span></div></div>
+    <div class="card"><div class="label">Góc nghiêng</div><div class="value"><span class="val-tilt">--</span><span class="unit">°</span></div></div>
+  </div>
+
+
+  <div class="charts">
+    <div class="card">
+      <div class="chart-title">Gia tốc tổng (g)</div>
+      <div class="chart-box"><canvas id="chartAcc"></canvas></div>
+    </div>
+    <div class="card">
+      <div class="chart-title">Góc nghiêng (độ)</div>
+      <div class="chart-box"><canvas id="chartTilt"></canvas></div>
+    </div>
+  </div>
+
+  <div class="card controls">
+    <div class="chart-title">Điều khiển cảnh báo (chế độ manual)</div>
+    <div class="btn-row">
+      <button class="btn-led" disabled>LED: TẮT</button>
+      <button class="btn-buzzer" disabled>Còi: TẮT</button>
+    </div>
+    <div class="hint">Khi phát hiện té ngã, LED và còi tự động báo động, không phụ thuộc nút bấm.</div>
+  </div>
+</div>
+
+<script>
+  // ============ CẤU HÌNH (phải khớp với code ESP32) ============
+  const TOPIC_BASE    = 'falldetect_nhom5';
+  const TOPIC_DATA    = TOPIC_BASE + '/data';
+  const TOPIC_CMD_LED = TOPIC_BASE + '/cmd/led';
+  const TOPIC_CMD_BUZ = TOPIC_BASE + '/cmd/buzzer';
+  const BROKER_URL    = 'wss://broker.hivemq.com:8884/mqtt';
+  const MAX_POINTS    = 60;
+
+  const $ = (sel) => document.querySelector(sel);
+
+
+  // ============ BIỂU ĐỒ ============
+  function makeChart(id, color) {
+    return new Chart(document.getElementById(id), {
+      type: 'line',
+      data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: color + '33',
+              fill: true, tension: 0.25, pointRadius: 0, borderWidth: 2 }] },
+      options: {
+        animation: false, responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { ticks: { maxTicksLimit: 6 } } }
+      }
+    });
+  }
+  const chartAcc  = makeChart('chartAcc',  '#2f6fed');
+  const chartTilt = makeChart('chartTilt', '#e8833a');
+
+  function pushPoint(chart, label, value) {
+    chart.data.labels.push(label);
+    chart.data.datasets[0].data.push(value);
+    if (chart.data.labels.length > MAX_POINTS) {
+      chart.data.labels.shift();
+      chart.data.datasets[0].data.shift();
+    }
+    chart.update('none');
+  }
+
+  // ============ CẬP NHẬT GIAO DIỆN ============
+  let manualLed = 0, manualBuz = 0;
+
+  function setButton(btn, on, name) {
+    btn.classList.toggle('on', !!on);
+    btn.textContent = name + ': ' + (on ? 'BẬT' : 'TẮT');
+
+  }
+
+  function updateUI(d) {
+    $('.val-ax').textContent    = d.ax.toFixed(2);
+    $('.val-ay').textContent    = d.ay.toFixed(2);
+    $('.val-az').textContent    = d.az.toFixed(2);
+    $('.val-acc').textContent   = d.acc.toFixed(2);
+    $('.val-pitch').textContent = d.pitch.toFixed(1);
+    $('.val-roll').textContent  = d.roll.toFixed(1);
+    $('.val-tilt').textContent  = d.tilt.toFixed(1);
+
+    const banner = $('.banner');
+    const alarm = d.alarm === 1;
+    banner.textContent = alarm ? 'PHÁT HIỆN TÉ NGÃ!' : 'Bình thường';
+    banner.classList.toggle('fall', alarm);
+
+    manualLed = d.mled; manualBuz = d.mbuz;
+    setButton($('.btn-led'), manualLed, 'LED');
+    setButton($('.btn-buzzer'), manualBuz, 'Còi');
+
+    const t = new Date().toLocaleTimeString('vi-VN');
+    pushPoint(chartAcc, t, d.acc);
+    pushPoint(chartTilt, t, d.tilt);
+  }
+
+  // ============ MQTT ============
+  const client = mqtt.connect(BROKER_URL, {
+    clientId: 'web_' + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 2000
+  });
+
+  client.on('connect', () => {
+
+    $('.btn-led').disabled = false;
+    $('.btn-buzzer').disabled = false;
+    client.subscribe(TOPIC_DATA);
+  });
+
+  client.on('close', () => {
+    $('.btn-led').disabled = true;
+    $('.btn-buzzer').disabled = true;
+  });
+
+  client.on('message', (topic, payload) => {
+    if (topic !== TOPIC_DATA) return;
+    try { updateUI(JSON.parse(payload.toString())); }
+    catch (e) { console.error('JSON lỗi:', e); }
+  });
+
+  // ============ NÚT ĐIỀU KHIỂN ============
+  $('.btn-led').addEventListener('click', () => {
+    client.publish(TOPIC_CMD_LED, manualLed ? 'OFF' : 'ON');
+  });
+  $('.btn-buzzer').addEventListener('click', () => {
+    client.publish(TOPIC_CMD_BUZ, manualBuz ? 'OFF' : 'ON');
+  });
+</script>
+</body>
+</html>
